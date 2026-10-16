@@ -323,10 +323,17 @@ impl Task {
     }
 
     pub async fn cancel(&self, sid: &str) -> Result<()> {
+        // A finished task has no download left to stop. Its cleaners only ask
+        // aria2c and ffmpeg about work that is already gone, which costs a
+        // round of retries per task.
+        let finished = self.state.get() == TaskState::Completed;
+
         /* BACKEND */
         self.state.set(TaskState::Cancelled);
         MANAGER.remove(sid, Some(&self.id)).await?;
-        RUNTIME.ctrl.get_handle(&self.id).await?.clean_all().await;
+        if !finished {
+            RUNTIME.ctrl.get_handle(&self.id).await?.clean_all().await;
+        }
 
         /* FRONTEND */
         frontend::task_updated(&self.id, None, None, Some(true))?;

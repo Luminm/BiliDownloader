@@ -10,10 +10,7 @@ use std::{
         Arc, LazyLock,
     },
 };
-use tokio::{
-    sync::{broadcast::Sender, RwLock, Semaphore},
-    task::JoinSet,
-};
+use tokio::sync::{broadcast::Sender, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::{storage::config, TauriResult};
@@ -62,13 +59,16 @@ impl CtrlHandle {
     }
     pub async fn clean_all(&self) {
         let cleaners = { self.cleaners.write().await.split_off(0) };
-        let mut set = JoinSet::new();
-        for c in cleaners {
-            set.spawn(async move {
-                let _ = c().await;
-            });
+        // The cleaners are registered in the order the work was started: the
+        // temp folder cleanup first, the running aria2c download or ffmpeg
+        // process last. A download or mux has to be stopped before the files
+        // it writes are deleted, otherwise the sidecar keeps writing into a
+        // directory that is gone and loses the state it would resume from.
+        for c in cleaners.into_iter().rev() {
+            if let Err(e) = c().await {
+                log::warn!("Failed to run a cleaner: {e:#}");
+            }
         }
-        set.join_all().await;
     }
 }
 
@@ -154,7 +154,27 @@ impl Ctrl {
     ) -> Result<()> {
         log::info!("Received event for scheduler#{sid}: {event:?}, state: {state:?}");
 
-        let scheduler = MANAGER.get_scheduler(sid).await?;
+        let scheduler = match MANAGER.get_scheduler(sid).await {
+            Ok(scheduler) => scheduler,
+            Err(e) => {
+                // A record that is already gone has nothing left to cancel, a
+                // repeated cancel must stay quiet instead of reporting an error
+                // that the frontend shows again and again.
+                if !matches!(event, CtrlEvent::Cancel) {
+                    return Err(e);
+                }
+                log::warn!("Scheduler#{sid} not found, cancel ignored");
+                return Ok(());
+            }
+        };
+
+        // A finished scheduler has no download left to stop, deleting it only
+        // drops its records.
+        if matches!(event, CtrlEvent::Cancel) && scheduler.state.get() == SchedulerState::Completed
+        {
+            return scheduler.discard().await;
+        }
+
         if !matches!(event, CtrlEvent::Resume) {
             scheduler.state(state).await?;
         }

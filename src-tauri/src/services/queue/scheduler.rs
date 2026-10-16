@@ -15,7 +15,7 @@ use super::{
 
 use crate::{
     shared::{get_sec, get_unique_path, process_err},
-    storage::{config, schedulers},
+    storage::{config, schedulers, tasks},
     TauriResult,
 };
 
@@ -134,6 +134,11 @@ impl Scheduler {
                 .move_scheduler(&self.sid, QueueType::Complete)
                 .await?;
             self.state(SchedulerState::Completed).await?;
+            // The record of a finished scheduler is temporary, it only lives in
+            // the memory of this session.
+            if let Err(e) = self.drop_rows().await {
+                log::error!("Scheduler#{} failed to drop its records: {e:#}", self.sid);
+            }
         } else {
             log::error!(
                 "Scheduler#{} not fully completed, currently in {:?}, state {:?}",
@@ -227,7 +232,11 @@ impl Scheduler {
 
         if let Err(e) = &res {
             log::error!("Task#{id} failed: {e:#}");
-            frontend::error(id, Some(sub_id), e)?;
+            // A task that is being cancelled fails on purpose, the frontend
+            // must not be told about it.
+            if !ctrl.is_cancelled() {
+                frontend::error(id, Some(sub_id), e)?;
+            }
             return res;
         }
 
@@ -272,6 +281,48 @@ impl Scheduler {
 
         /* DATABASE */
         schedulers::update_state(&self.sid, state as u8).await?;
+        Ok(())
+    }
+
+    // The rows go away instead of being kept up to date: the record of a
+    // finished scheduler is temporary and must not come back after a restart.
+    async fn drop_rows(&self) -> Result<()> {
+        let list = self.list.read().await.clone();
+        tasks::delete_many(&list).await?;
+        schedulers::delete(&self.sid).await?;
+        Ok(())
+    }
+
+    // Deletes the record of a finished scheduler. Nothing is left to stop, so
+    // the tasks are not cancelled, only their records are dropped.
+    pub async fn discard(self: Arc<Self>) -> Result<()> {
+        let list = self.list.read().await.clone();
+
+        /* BACKEND */
+        {
+            let mut tasks = MANAGER.tasks.write().await;
+            for id in &list {
+                tasks.remove(id);
+            }
+        }
+
+        /* FRONTEND */
+        for id in &list {
+            frontend::task_updated(id, None, None, Some(true))?;
+        }
+
+        if let Err(e) = MANAGER.remove(&self.sid, None).await {
+            log::error!("Scheduler#{} failed to remove itself: {e:#}", self.sid);
+            return Err(e);
+        }
+
+        /* FRONTEND */
+        frontend::scheduler_updated(&self.sid, None, None, None, Some(true))?;
+
+        /* DATABASE */
+        if let Err(e) = self.drop_rows().await {
+            log::error!("Scheduler#{} failed to drop its records: {e:#}", self.sid);
+        }
         Ok(())
     }
 

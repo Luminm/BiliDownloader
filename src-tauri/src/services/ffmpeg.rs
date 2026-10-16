@@ -27,6 +27,23 @@ fn clean_log(raw_log: &[u8]) -> String {
         .join("\n")
 }
 
+// A copy mux ends at the first premature end of either input and still exits
+// successfully, so the produced file is the only evidence both inputs were
+// read to the end. The expected length comes from the media item and may be
+// slightly off, the missing piece that matters here is a whole tail.
+const DURATION_TOLERANCE: u64 = 120;
+
+async fn ensure_duration(path: &Path, expected: u64) -> Result<()> {
+    let actual = probe_duration(path).await?;
+    if actual + DURATION_TOLERANCE < expected {
+        return Err(anyhow!(
+            "{} is {actual}s long while the source is {expected}s",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 pub async fn test() -> Result<()> {
     let app = get_app_handle();
     let result = app
@@ -135,6 +152,7 @@ pub async fn merge(
 
     let cmd = c.spawn()?;
     monitor(duration, cmd, ctrl, req).await?;
+    ensure_duration(&output, duration).await?;
     Ok(output)
 }
 

@@ -2,8 +2,9 @@ use anyhow::{anyhow, Context, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    io::{ErrorKind, SeekFrom},
     net::TcpListener,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, LazyLock},
     time::Duration,
 };
@@ -16,7 +17,12 @@ use tauri_plugin_shell::{
     process::{CommandChild, CommandEvent},
     ShellExt,
 };
-use tokio::{fs, sync::RwLock, time::sleep};
+use tokio::{
+    fs,
+    io::{AsyncReadExt, AsyncSeekExt},
+    sync::RwLock,
+    time::sleep,
+};
 
 use crate::{
     shared::{get_app_handle, process_err, random_string, Sidecar, USER_AGENT, WORKING_PATH},
@@ -175,6 +181,11 @@ impl Aria2Rpc {
 }
 
 fn is_retryable_rpc_error(err: &TauriError) -> bool {
+    // A GID that aria2c no longer knows will not come back, retrying the same
+    // request only delays the caller.
+    if is_missing_gid(err) {
+        return false;
+    }
     if let Some(code) = err.code {
         let code = code.as_isize();
         if matches!(
@@ -219,6 +230,12 @@ fn is_retryable_rpc_error(err: &TauriError) -> bool {
         || message.contains("connection reset")
         || message.contains("connection refused")
         || message.contains("network error")
+}
+
+// aria2c drops a GID as soon as its download result is removed, every later
+// request for that GID answers "GID ... is not found" and nothing else.
+fn is_missing_gid(err: &TauriError) -> bool {
+    err.message.contains("is not found")
 }
 
 async fn daemon(name: &'static str, pid: u32, rx: &mut Receiver<CommandEvent>) {
@@ -376,17 +393,276 @@ pub async fn cancel(gid: &str) -> TauriResult<()> {
 }
 
 pub async fn pause(gid: &str) -> TauriResult<()> {
+    match ARIA2_RPC.request::<Value>("pause", vec![json!(gid)]).await {
+        Ok(_) => Ok(()),
+        // The download is already gone, there is nothing left to pause.
+        Err(e) if is_missing_gid(&e) => {
+            log::warn!("aria2c task#{gid} not found, nothing to pause");
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+pub async fn resume(gid: &str) -> TauriResult<()> {
+    match ARIA2_RPC
+        .request::<Value>("unpause", vec![json!(gid)])
+        .await
+    {
+        Ok(_) => Ok(()),
+        // The download is already gone, there is nothing left to resume.
+        Err(e) if is_missing_gid(&e) => {
+            log::warn!("aria2c task#{gid} not found, nothing to resume");
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+// aria2c reports a download as complete once every piece it knows about has
+// arrived. A file that an earlier attempt preallocated but never filled in
+// satisfies that status while most of it is still zeros, so the status alone
+// cannot be used to hand the file to the muxer.
+const DOWNLOAD_ATTEMPTS: usize = 3;
+// The gap an interrupted download leaves behind is a run of zeros, a whole
+// block of them is not something a media segment contains.
+const HOLE_CHECK_LEN: u64 = 1 << 20;
+// The uri is added right before the first poll, aria2c may need a moment
+// before it answers for the GID.
+const GID_WAIT_LIMIT: usize = 10;
+const TAIL_CHECK_LEN: u64 = 64 * 1024;
+
+fn control_file(path: &Path) -> PathBuf {
+    let mut raw = path.as_os_str().to_owned();
+    raw.push(".aria2");
+    PathBuf::from(raw)
+}
+
+// The data file and its control file belong together, a half removed pair
+// cannot be resumed and must not be left behind for the next attempt.
+async fn discard_download(path: &Path) {
+    for path in [path.to_path_buf(), control_file(path)] {
+        if let Err(e) = fs::remove_file(&path).await {
+            if e.kind() != ErrorKind::NotFound {
+                log::warn!("Failed to remove {}: {e:#}", path.display());
+            }
+        }
+    }
+}
+
+// The unwritten region of a preallocated file reads as zeros, a finished media
+// segment ends with real data.
+async fn tail_is_zero(path: &Path) -> Result<bool> {
+    let len = fs::metadata(path).await?.len();
+    let start = len.saturating_sub(TAIL_CHECK_LEN);
+    let mut file = fs::File::open(path).await?;
+    file.seek(SeekFrom::Start(start)).await?;
+    let mut tail = Vec::with_capacity((len - start) as usize);
+    file.read_to_end(&mut tail).await?;
+    Ok(tail.iter().all(|b| *b == 0))
+}
+
+// The offset of the first unwritten block, or None when the file has no gap.
+async fn first_hole(path: &Path) -> Result<Option<u64>> {
+    let len = fs::metadata(path).await?.len();
+    let mut file = fs::File::open(path).await?;
+    let mut buf = vec![0u8; HOLE_CHECK_LEN as usize];
+    let mut offset = 0;
+    while offset < len {
+        let read = file.read(&mut buf).await?;
+        if read == 0 {
+            break;
+        }
+        if buf[..read].iter().all(|b| *b == 0) {
+            return Ok(Some(offset));
+        }
+        offset += read as u64;
+    }
+    Ok(None)
+}
+
+// The offset after the last byte that was actually written.
+async fn last_data_end(path: &Path) -> Result<u64> {
+    let mut end = fs::metadata(path).await?.len();
+    let mut file = fs::File::open(path).await?;
+    let mut buf = vec![0u8; TAIL_CHECK_LEN as usize];
+    while end > 0 {
+        let start = end.saturating_sub(TAIL_CHECK_LEN);
+        let size = (end - start) as usize;
+        file.seek(SeekFrom::Start(start)).await?;
+        file.read_exact(&mut buf[..size]).await?;
+        if let Some(pos) = buf[..size].iter().rposition(|b| *b != 0) {
+            return Ok(start + pos as u64 + 1);
+        }
+        end = start;
+    }
+    Ok(0)
+}
+
+// A rejected download keeps every byte that was already written: the file is
+// cut at its first gap and aria2c is asked for the rest, so a broken tail
+// costs the missing part instead of the whole file. The control file goes away
+// with the cut, otherwise aria2c resumes from a bitfield that no longer
+// describes the file.
+async fn trim_download(path: &Path) -> TauriResult<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let cut = match first_hole(path).await? {
+        Some(hole) => hole,
+        None => {
+            if tail_is_zero(path).await? {
+                last_data_end(path).await?
+            } else {
+                return Ok(());
+            }
+        }
+    };
+    if cut == 0 {
+        discard_download(path).await;
+        return Ok(());
+    }
+    log::info!(
+        "Trimming {} to {cut} bytes, the rest is downloaded again",
+        path.display()
+    );
+    fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .await?
+        .set_len(cut)
+        .await?;
+    if let Err(e) = fs::remove_file(control_file(path)).await {
+        if e.kind() != ErrorKind::NotFound {
+            log::warn!("Failed to remove the control file: {e:#}");
+        }
+    }
+    Ok(())
+}
+
+// Returns the verified size of a finished download, or the evidence the file
+// is missing to be usable.
+async fn verify_download(data: &Aria2TellStatus, path: &Path) -> Result<u64> {
+    let total = data.total_length.parse::<u64>().unwrap_or(0);
+    let done = data.completed_length.parse::<u64>().unwrap_or(0);
+    if total == 0 {
+        return Err(anyhow!("aria2c reported no size for {}", path.display()));
+    }
+    if done != total {
+        return Err(anyhow!(
+            "aria2c downloaded {done} of {total} bytes for {}",
+            path.display()
+        ));
+    }
+    let len = fs::metadata(path)
+        .await
+        .context(format!("Failed to read {}", path.display()))?
+        .len();
+    if len != total {
+        return Err(anyhow!(
+            "{} is {len} bytes while {total} bytes were reported",
+            path.display()
+        ));
+    }
+    if let Some(hole) = first_hole(path).await? {
+        return Err(anyhow!(
+            "{} has an unwritten region at {hole}",
+            path.display()
+        ));
+    }
+    if tail_is_zero(path).await? {
+        return Err(anyhow!("the tail of {} was never written", path.display()));
+    }
+    Ok(total)
+}
+
+async fn add_uri(req: &SubTaskReq, gid: &str, urls: &Vec<String>, name: &str) -> TauriResult<()> {
     ARIA2_RPC
-        .request::<Value>("pause", vec![json!(gid)])
+        .request::<Value>(
+            "addUri",
+            vec![
+                json!(urls),
+                json!({"dir": req.temp, "out": name, "gid": gid}),
+            ],
+        )
         .await?;
     Ok(())
 }
 
-pub async fn resume(gid: &str) -> TauriResult<()> {
-    ARIA2_RPC
-        .request::<Value>("unpause", vec![json!(gid)])
-        .await?;
+// A rejected attempt keeps what it already downloaded: the result in aria2c is
+// dropped, the file is trimmed to its first gap and the uri is added again.
+async fn restart_download(
+    gid: &str,
+    req: &SubTaskReq,
+    urls: &Vec<String>,
+    name: &str,
+    output: &Path,
+) -> TauriResult<()> {
+    cancel(gid).await?;
+    trim_download(output).await?;
+    add_uri(req, gid, urls, name).await?;
     Ok(())
+}
+
+// A download that is still moving is never given up on, only a GID aria2c has
+// forgotten is added again.
+async fn poll_until_complete(
+    gid: &str,
+    req: &SubTaskReq,
+    urls: &Vec<String>,
+    name: &str,
+) -> TauriResult<Aria2TellStatus> {
+    let sub = &req.subtask;
+    let mut missing = 0;
+    loop {
+        let data = match ARIA2_RPC
+            .request::<Aria2TellStatus>("tellStatus", vec![json!(gid)])
+            .await
+        {
+            Ok(data) => {
+                missing = 0;
+                data
+            }
+            // The uri was just added, the GID is not known yet.
+            Err(e) if is_missing_gid(&e) && missing < GID_WAIT_LIMIT => {
+                missing += 1;
+                sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        if let Some(code) = data.error_code.as_deref() {
+            let code = code.parse::<isize>().unwrap_or(-1);
+            if code != 0 && code != 31 {
+                return Err(TauriError::new(
+                    data.error_message.clone().unwrap_or_default(),
+                    Some(code),
+                ));
+            }
+        }
+        let content = data.total_length.parse::<u64>().unwrap_or(0);
+        let chunk = data.completed_length.parse::<u64>().unwrap_or(0);
+        match data.status.as_str() {
+            "complete" => return Ok(data),
+            "active" => {
+                if content > 0 && chunk > 0 {
+                    sub.send(content, chunk.min(content)).await?;
+                }
+            }
+            "paused" => {
+                ARIA2_RPC
+                    .request::<Value>("unpause", vec![json!(gid)])
+                    .await?;
+            }
+            // aria2c removed the download on its own, it has to be added again.
+            "removed" => {
+                log::warn!("aria2c task#{gid} was removed, adding uri again...");
+                add_uri(req, gid, urls, name).await?;
+            }
+            _ => (),
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
 }
 
 pub async fn download(
@@ -414,12 +690,19 @@ pub async fn download(
     match result {
         Ok(v) => match v.status.as_str() {
             "complete" => {
-                let total = v.total_length.parse::<u64>().unwrap_or(0);
-                log::info!("aria2c task#{gid} already completed with total {total}");
-                if total > 0 {
-                    sub.send(total, total).await?;
+                log::info!("aria2c task#{gid} already completed");
+                match verify_download(&v, &output).await {
+                    Ok(total) => {
+                        sub.send(total, total).await?;
+                        return Ok(output);
+                    }
+                    // The recorded result points at a file that is not a full
+                    // copy, the download has to be redone from scratch.
+                    Err(e) => {
+                        log::warn!("aria2c task#{gid} result rejected: {e:#}");
+                        restart_download(gid, req, urls, name, &output).await?;
+                    }
                 }
-                return Ok(output);
             }
             "paused" => {
                 log::info!("aria2c task#{gid} paused, resuming...");
@@ -433,15 +716,11 @@ pub async fn download(
         },
         Err(_) => {
             log::info!("aria2c task#{gid} not found, adding uri...");
-            ARIA2_RPC
-                .request::<Value>(
-                    "addUri",
-                    vec![
-                        json!(urls),
-                        json!({"dir": req.temp, "out": name, "gid": gid}),
-                    ],
-                )
-                .await?;
+            // A leftover file from an earlier attempt is cut at its first gap,
+            // aria2c then fetches only the part that is missing instead of the
+            // whole segment again.
+            trim_download(&output).await?;
+            add_uri(req, gid, urls, name).await?;
         }
     };
 
@@ -452,38 +731,34 @@ pub async fn download(
     })
     .await;
 
-    loop {
-        let data = ARIA2_RPC
-            .request::<Aria2TellStatus>("tellStatus", vec![json!(gid)])
-            .await?;
-        if let Some(code) = data.error_code {
-            let code = code.parse::<isize>().unwrap_or(-1);
-            if code != 0 && code != 31 {
-                return Err(TauriError::new(
-                    data.error_message.unwrap_or_default(),
-                    Some(code),
-                ));
+    let mut last_error = None;
+    for attempt in 1..=DOWNLOAD_ATTEMPTS {
+        let verified = match poll_until_complete(gid, req, urls, name).await {
+            Ok(data) => verify_download(&data, &output).await,
+            Err(e) => Err(anyhow!("{e}")),
+        };
+        match verified {
+            Ok(total) => {
+                sub.send(total, total).await?;
+                return Ok(output);
+            }
+            Err(e) => {
+                log::warn!(
+                    "aria2c task#{gid} download rejected (attempt {attempt}/{DOWNLOAD_ATTEMPTS}): {e:#}"
+                );
+                last_error = Some(e);
+                if attempt < DOWNLOAD_ATTEMPTS {
+                    restart_download(gid, req, urls, name, &output).await?;
+                }
             }
         }
-        let content = data.total_length.parse::<u64>().unwrap_or(0);
-        let chunk = data.completed_length.parse::<u64>().unwrap_or(0);
-        match data.status.as_str() {
-            "active" => {
-                if content == 0 || chunk == 0 {
-                    sleep(Duration::from_secs(1)).await;
-                    continue;
-                }
-                sub.send(content, chunk.min(content)).await?;
-            }
-            "complete" => {
-                if content > 0 {
-                    sub.send(content, content).await?;
-                }
-                break;
-            }
-            _ => (),
-        }
-        sleep(Duration::from_secs(1)).await;
     }
-    Ok(output)
+
+    let reason = last_error
+        .map(|e| format!("{e:#}"))
+        .unwrap_or_else(|| "unknown reason".into());
+    Err(TauriError::new(
+        format!("aria2c task#{gid} did not produce a complete file after {DOWNLOAD_ATTEMPTS} attempts: {reason}"),
+        None::<isize>,
+    ))
 }

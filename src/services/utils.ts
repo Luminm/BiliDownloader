@@ -18,6 +18,13 @@ export type AppLogOptions = {
 
 const DEFAULT_RETRIES = 4;
 
+// A failure that keeps repeating while a request is retried or a record is
+// deleted must not stack up in the window: errors are shown one at a time.
+let errorToast: { id: string | number | null; message: string } = {
+  id: null,
+  message: String(),
+};
+
 export function AppLog(
   message: string,
   _type?: `${TYPE}`,
@@ -45,12 +52,25 @@ export function AppLog(
       break;
     }
   }
-  if (options?.toast !== false) {
-    useToast()(message, {
-      type,
-      timeout: type === TYPE.ERROR ? false : 3000,
-    });
+  if (options?.toast === false) return;
+
+  const toast = useToast();
+  if (type !== TYPE.ERROR) {
+    toast(message, { type, timeout: 3000 });
+    return;
   }
+  if (errorToast.message === message) return;
+  if (errorToast.id !== null) toast.dismiss(errorToast.id);
+  errorToast = {
+    id: toast(message, {
+      type,
+      timeout: false,
+      onClose: () => {
+        errorToast = { id: null, message: String() };
+      },
+    }),
+    message,
+  };
 }
 
 export function setEventHook() {

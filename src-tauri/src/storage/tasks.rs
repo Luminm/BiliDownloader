@@ -174,3 +174,20 @@ pub async fn delete(id: &str) -> Result<()> {
     sqlx::query_with(&sql, values).execute(&pool).await?;
     Ok(())
 }
+
+// The pool holds a single connection, dropping the records of a scheduler must
+// not queue one statement per task.
+pub async fn delete_many(ids: &[String]) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+
+    let (sql, values) = Query::delete()
+        .from_table(Tasks::Table)
+        .cond_where(Expr::col(Tasks::Name).is_in(ids.iter().map(|id| id.as_str())))
+        .build_sqlx(SqliteQueryBuilder);
+
+    let pool = get_db().await?;
+    sqlx::query_with(&sql, values).execute(&pool).await?;
+    Ok(())
+}

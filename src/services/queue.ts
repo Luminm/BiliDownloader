@@ -362,7 +362,11 @@ export async function handleEvent(event: backend.QueueEvent) {
   const queue = useQueueStore();
   if (type === 'taskUpdated') {
     const task = queue.tasks[event.id];
-    if (!task) throw new AppError(`Task#${event.id} not found`);
+    // A record dropped on this side can still receive late updates.
+    if (!task) {
+      AppLog(`Task#${event.id} not found`, 'warning', { toast: false });
+      return;
+    }
 
     if (event.state) {
       task.state = event.state;
@@ -381,7 +385,10 @@ export async function handleEvent(event: backend.QueueEvent) {
     }
   } else if (type === 'schedulerUpdated') {
     const scheduler = queue.schedulers[event.id];
-    if (!scheduler) throw new AppError(`Scheduler#${event.id} not found`);
+    if (!scheduler) {
+      AppLog(`Scheduler#${event.id} not found`, 'warning', { toast: false });
+      return;
+    }
 
     if (event.state) {
       scheduler.state = event.state;
